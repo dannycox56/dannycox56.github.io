@@ -81,7 +81,7 @@ button.item:active{background:var(--bg)}
 .btn.danger{background:var(--red-soft);color:var(--red)}
 .btn.block{width:100%}
 .btn.sm{padding:6px 12px;min-height:34px;font-size:14px;border-radius:10px}
-.link{background:none;border:0;color:var(--accent);font-weight:600;padding:4px 0}
+.link{background:none;border:0;color:var(--accent);font-weight:600;padding:4px 0;text-align:left;display:block}
 .chips{display:flex;gap:8px;overflow-x:auto;padding:2px 0 10px;scrollbar-width:none}
 .chips::-webkit-scrollbar{display:none}
 .chip{flex:none;border:0;border-radius:99px;padding:7px 14px;background:var(--chip);font-size:14px;font-weight:500}
@@ -439,6 +439,7 @@ const Core = (() => {
       if (o.account !== checking || o.date <= from || o.date > to) continue;
       ev.push({ key: `one:${o.id}`, date: o.date, name: o.name, amount: o.amount, dir: o.dir, kind: 'one', oneId: o.id, est: o.status === 'estimated', pending: o.status === 'pending', skipped: skips.has(`one:${o.id}`) });
     }
+    for (const e of reimbEvents(state, from, to)) { e.skipped = skips.has(e.key); ev.push(e); }
     // same day: money out first (worst case)
     ev.sort((a, b) => a.date !== b.date ? (a.date < b.date ? -1 : 1) : (a.dir === b.dir ? 0 : a.dir === 'out' ? -1 : 1));
     let bal = S.balance, low = bal, lowDate = from;
@@ -460,9 +461,10 @@ const Core = (() => {
       for (const d of occurrences(item, addDays(from, -31), addDays(from, 120))) payMonths[monthOf(d)] = (payMonths[monthOf(d)] || 0) + 1;
     }
     const threePay = Object.keys(payMonths).filter(m => payMonths[m] >= 3 && m >= monthOf(from)).sort();
+    const held = fundsHeld(state, ev);
     return {
-      from, to, start: S.balance, events: ev, end: bal, low: r2(low), lowDate, status, floor,
-      safeToSpend: r2(Math.max(0, low - floor)), nextPay, lowBeforePay: r2(lowBeforePay), firstBelow, threePay
+      from, to, start: S.balance, events: ev, end: bal, low: r2(low), lowDate, status, floor, held,
+      safeToSpend: r2(Math.max(0, low - floor - held)), nextPay, lowBeforePay: r2(lowBeforePay), firstBelow, threePay
     };
   }
 
@@ -504,11 +506,204 @@ const Core = (() => {
   // ---------- emergency fund ----------
   function emergencyFund(state, fc) {
     const E = state.settings.ef;
-    const amount = E.mode === 'savings' ? (E.savingsBalance || 0) : Math.max(0, fc.low - state.settings.floor);
+    const amount = E.mode === 'savings' ? (E.savingsBalance || 0) : Math.max(0, fc.low - state.settings.floor - (fc.held || 0));
     const steps = [...E.steps].sort((a, b) => a.amount - b.amount);
     let current = steps.find(s => amount < s.amount) || null;
     const prev = current ? (steps[steps.indexOf(current) - 1] || { amount: 0 }) : steps[steps.length - 1];
     return { amount: r2(amount), steps, current, prevAmount: prev ? prev.amount : 0, goal: E.goal, mode: E.mode };
+  }
+
+  // ---------- shared matching ----------
+  const splitPats = s => String(s || '').split(',').map(x => x.trim()).filter(Boolean);
+  const matchAny = (t, pats) => { const d = ((t.desc || '') + ' ' + (t.note || '')).toUpperCase(); return pats.some(p => d.includes(p.toUpperCase())); };
+  const monthsBetween = (a, b) => { const [ay, am] = a.split('-').map(Number), [by, bm] = b.split('-').map(Number); return (by - ay) * 12 + (bm - am); };
+  const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+  // ---------- health reimbursement ----------
+  // Allowance accrues each month of the plan year (Jan–Dec). Payouts are matched to the
+  // oldest months first, so lump payments (3 months at once) are handled.
+  function reimbYear(state, year, asOf) {
+    const R = state.reimb; if (!R || !R.enabled || !(R.allowance > 0)) return null;
+    asOf = asOf || today();
+    const y = String(year), cur = monthOf(asOf);
+    const premPats = splitPats(R.premiumMatch);
+    const premiums = {};
+    for (const t of state.transactions) {
+      if (t.amount >= 0 || !t.date.startsWith(y) || !premPats.length || !matchAny(t, premPats)) continue;
+      const ym = monthOf(t.date); if (!premiums[ym]) premiums[ym] = { date: t.date, amount: r2(-t.amount) };
+    }
+    const payouts = state.transactions.filter(t => t.cat === 'reimb' && t.amount > 0 && t.date.startsWith(y)).sort((a, b) => a.date < b.date ? -1 : 1);
+    const paidTotal = r2(payouts.reduce((s, t) => s + t.amount, 0));
+    let units = Math.floor((paidTotal + 1) / R.allowance);
+    const months = [];
+    for (let m = 1; m <= 12; m++) {
+      const ym = `${y}-${pad(m)}`, c = (R.claims || {})[ym] || {};
+      const o = { ym, name: MONTH_NAMES[m - 1], short: MONTH_NAMES[m - 1].slice(0, 3), claim: c, premium: premiums[ym] || null, amount: R.allowance, auto: false };
+      if (units > 0) { units--; o.status = 'paid'; o.auto = true; }
+      else if (c.status === 'paid') o.status = 'paid';
+      else if (c.status === 'skip') o.status = 'skip';
+      else if (c.status === 'approved') o.status = 'approved';
+      else if (c.status === 'submitted') o.status = 'submitted';
+      else if (ym > cur) o.status = 'future';
+      else if (ym === cur && !o.premium) o.status = 'waiting';
+      else o.status = 'todo';
+      months.push(o);
+    }
+    const alerts = [];
+    for (const o of months) {
+      if (o.status === 'todo') alerts.push({ level: o.ym < cur ? 'warn' : 'info', ym: o.ym, text: o.ym < cur ? `No claim found for ${o.name}. Submit it if you haven't.` : `Your ${o.name} premium has posted. Submit your claim.` });
+      if (o.status === 'submitted' && o.claim.submitted && diffDays(o.claim.submitted, asOf) > 14) alerts.push({ level: 'warn', ym: o.ym, text: `${o.name} claim was submitted ${diffDays(o.claim.submitted, asOf)} days ago and isn't approved yet. Check it in Vitable.` });
+      if (o.status === 'approved' && o.claim.approved && diffDays(o.claim.approved, asOf) > 10) alerts.push({ level: 'warn', ym: o.ym, text: `${o.name} was approved ${diffDays(o.claim.approved, asOf)} days ago but the payment hasn't shown up. Import your checking or mark it paid.` });
+    }
+    const open = months.filter(o => ['todo', 'waiting', 'submitted'].includes(o.status) && o.ym <= cur);
+    if (asOf.slice(0, 4) === y && asOf.slice(5, 7) === '12' && open.length)
+      alerts.unshift({ level: 'warn', ym: `${y}-12`, text: `The ${y} plan year ends Dec 31. Submit ${open.map(o => o.name).join(', ')} before then.` });
+    const elapsed = months.filter(o => o.ym <= cur).length;
+    const paidMonths = months.filter(o => o.status === 'paid').length;
+    return {
+      year: y, months, alerts, allowance: R.allowance, payouts,
+      paidTotal: r2(paidTotal + months.filter(o => o.status === 'paid' && !o.auto).length * R.allowance), payoutTotal: paidTotal,
+      earned: r2(R.allowance * elapsed), paidMonths, unclaimed: r2(R.allowance * Math.max(0, elapsed - paidMonths)),
+      next: months.find(o => ['todo', 'submitted', 'approved', 'waiting'].includes(o.status)) || null
+    };
+  }
+
+  function reimbEvents(state, from, to) {
+    const R = state.reimb, out = [];
+    if (!R || !R.enabled) return out;
+    const y = +from.slice(0, 4);
+    for (const year of [y - 1, y]) {
+      const ry = reimbYear(state, year, from); if (!ry) continue;
+      for (const o of ry.months) {
+        if (o.status !== 'approved' && o.status !== 'submitted') continue;
+        const c = o.claim;
+        let d = o.status === 'approved' ? (c.expected || addDays(c.approved || from, R.expectDays || 3)) : addDays(c.submitted || from, 14);
+        if (d <= from) d = addDays(from, 1);
+        if (d > to) continue;
+        out.push({ key: `reimb:${o.ym}`, date: d, name: `Health reimbursement – ${o.name}`, amount: r2(c.amount || R.allowance), dir: 'in', account: state.settings.mainAccount, kind: 'reimb', ym: o.ym, est: o.status === 'approved', pending: o.status === 'submitted' });
+      }
+    }
+    return out;
+  }
+
+  // Finds the monthly allowance from past payouts (a $939.99 payout = 3 × $313.33).
+  function guessAllowance(state) {
+    const all = state.transactions.filter(t => t.cat === 'reimb' && t.amount > 50);
+    if (!all.length) return 0;
+    const latest = all.reduce((m, t) => t.date > m ? t.date : m, '');
+    const pays = all.filter(t => diffDays(t.date, latest) <= 300).map(t => t.amount);
+    const cands = [];
+    for (const p of pays) for (let k = 1; k <= 6; k++) cands.push(r2(p / k));
+    let best = 0, bestScore = 0;
+    for (const c of cands) {
+      if (c < 50) continue;
+      const score = pays.filter(p => { const k = Math.round(p / c); return k >= 1 && Math.abs(p - k * c) <= 1; }).length;
+      if (score > bestScore || (score === bestScore && c > best)) { best = c; bestScore = score; }
+    }
+    return bestScore >= Math.min(2, pays.length) ? best : 0;
+  }
+
+  // ---------- set-asides ----------
+  function fundStatus(state, f, asOf) {
+    asOf = asOf || today();
+    const start = f.start || (monthOf(asOf) + '-01');
+    const pats = splitPats(f.match), cats = f.cats || [];
+    const payments = state.transactions.filter(t => t.amount < 0 && t.date >= start && t.date <= asOf &&
+      (t.fund === f.id || (!t.fund && (cats.includes(t.cat) || (pats.length && matchAny(t, pats))))));
+    let bal = f.startBalance || 0, accrued = 0, spent = 0;
+    const n = Math.max(0, monthsBetween(monthOf(start), monthOf(asOf)));
+    for (let k = 0; k <= n; k++) {
+      const [yy, mm] = addMonths(+start.slice(0, 4), +start.slice(5, 7), k), ym = `${yy}-${pad(mm)}`;
+      bal += f.monthly; accrued += f.monthly;
+      if (f.cap > 0 && bal > f.cap) { accrued -= bal - f.cap; bal = f.cap; }
+      for (const t of payments) if (monthOf(t.date) === ym) { bal += t.amount; spent -= t.amount; }
+    }
+    return { id: f.id, name: f.name, monthly: f.monthly, balance: r2(bal), accrued: r2(accrued), spent: r2(spent), payments, cap: f.cap || 0, start };
+  }
+  function fundsHeld(state) {
+    return r2((state.funds || []).reduce((s, f) => s + Math.max(0, fundStatus(state, f).balance), 0));
+  }
+
+  // ---------- watch list ----------
+  const merchantKey = desc => {
+    let d = String(desc || '').toUpperCase().replace(/^(SQ \*|TST\* ?|PAR\*|NYX\*|PY \*|SP |DD \*)/, '');
+    d = d.replace(/[^A-Z ]+/g, ' ').replace(/\s+/g, ' ').trim();
+    return d.split(' ').slice(0, 2).join(' ');
+  };
+  const PERIODS = [['weekly', 5, 9, 7], ['monthly', 25, 36, 30.4], ['quarterly', 80, 100, 91], ['yearly', 340, 390, 365]];
+
+  function watchList(state) {
+    const kinds = Object.fromEntries(state.categories.map(c => [c.id, c.kind]));
+    const lastByAcct = {};
+    for (const t of state.transactions) if (t.src !== 'manual' && (!lastByAcct[t.account] || t.date > lastByAcct[t.account])) lastByAcct[t.account] = t.date;
+    const groups = {};
+    for (const t of state.transactions) {
+      if (t.amount >= 0 || ['gas', 'eatout'].includes(t.cat) || (kinds[t.cat] && kinds[t.cat] !== 'spend')) continue;
+      const k = merchantKey(t.desc); if (!k) continue;
+      (groups[k] = groups[k] || []).push({ date: t.date, amount: -t.amount, account: t.account, desc: t.desc, noSeries: ['groceries', 'amazon'].includes(t.cat) && !/PRIME/i.test(t.desc) });
+    }
+    const series = [], items = [];
+    for (const [key, list] of Object.entries(groups)) {
+      // duplicates: same merchant + amount within a day, recently
+      const byDate = list.slice().sort((a, b) => a.date < b.date ? -1 : 1);
+      for (let i = 1; i < byDate.length; i++) {
+        const a = byDate[i - 1], b = byDate[i];
+        if (a.amount === b.amount && a.amount >= 5 && Math.abs(diffDays(a.date, b.date)) <= 1 && diffDays(b.date, lastByAcct[b.account]) <= 60)
+          items.push({ id: `dup|${key}|${b.date}|${b.amount}`, type: 'duplicate', title: b.desc, detail: `Charged ${'$' + b.amount.toFixed(2)} twice (${a.date} and ${b.date}). Check it isn't a double charge.`, amount: b.amount, date: b.date });
+      }
+      // cluster by similar amount
+      const sorted = list.filter(x => !x.noSeries).sort((a, b) => a.amount - b.amount);
+      const clusters = [];
+      for (const x of sorted) { const c = clusters[clusters.length - 1]; if (c && x.amount <= c[c.length - 1].amount * 1.15 + 0.5) c.push(x); else clusters.push([x]); }
+      const found = [];
+      for (const c of clusters) {
+        if (c.length < 2) continue;
+        c.sort((a, b) => a.date < b.date ? -1 : 1);
+        const gaps = []; for (let i = 1; i < c.length; i++) gaps.push(diffDays(c[i - 1].date, c[i].date));
+        const med = gaps.slice().sort((a, b) => a - b)[Math.floor(gaps.length / 2)];
+        const p = PERIODS.find(([, lo, hi]) => med >= lo && med <= hi); if (!p) continue;
+        if (p[0] !== 'yearly' && c.length < 3) continue;
+        const ok = gaps.filter(g => g >= med * 0.7 && g <= med * 1.35).length / gaps.length; if (ok < 0.6) continue;
+        const last = c[c.length - 1], acctLast = lastByAcct[last.account];
+        const stopped = diffDays(last.date, acctLast) > med * 1.5 + 7;
+        let changeAt = null, prevAmt = null;
+        for (let i = c.length - 1; i > 0; i--) if (Math.abs(c[i].amount - c[i - 1].amount) >= 0.5) {
+          // only flag a change when the price had been steady before it (skips usage bills like electric)
+          const steady = i >= 2 && Math.abs(c[i - 1].amount - c[i - 2].amount) <= c[i - 1].amount * 0.015;
+          if (steady) { changeAt = c[i].date; prevAmt = c[i - 1].amount; }
+          break;
+        }
+        found.push({ key, label: last.desc, period: p[0], days: med, monthly: r2(last.amount * 30.4 / p[3]), amount: last.amount, first: c[0].date, last: last.date, n: c.length, stopped, changeAt, prevAmt, acctLast, account: last.account });
+      }
+      for (const s of found) {
+        const replacement = found.find(o => o !== s && !o.stopped && o.period === s.period && o.first > s.last);
+        if (s.stopped && replacement) {
+          if (diffDays(replacement.first, replacement.acctLast) <= 120)
+            items.push({ id: `price|${key}|${replacement.first}`, type: 'price', title: replacement.label, detail: `Price changed from $${s.amount.toFixed(2)} to $${replacement.amount.toFixed(2)} (${replacement.period}) starting ${replacement.first}.`, amount: replacement.amount, date: replacement.first });
+          continue;
+        }
+        series.push(s);
+        if (s.stopped) {
+          if (diffDays(s.last, s.acctLast) <= 150)
+            items.push({ id: `stop|${key}|${s.amount}|${s.last}`, type: 'stopped', title: s.label, detail: `${s.period[0].toUpperCase() + s.period.slice(1)} $${s.amount.toFixed(2)} charge stopped after ${s.last}. Good if you cancelled it; check if you didn't.`, amount: s.amount, date: s.last });
+          continue;
+        }
+        if (s.changeAt && diffDays(s.changeAt, s.acctLast) <= 120)
+          items.push({ id: `price|${key}|${s.changeAt}`, type: 'price', title: s.label, detail: `Went ${s.amount > s.prevAmt ? 'up' : 'down'} from $${s.prevAmt.toFixed(2)} to $${s.amount.toFixed(2)} on ${s.changeAt}.`, amount: s.amount, date: s.changeAt });
+        if (diffDays(s.first, s.acctLast) <= 100)
+          items.push({ id: `new|${key}|${s.first}`, type: 'new', title: s.label, detail: `New ${s.period} charge of $${s.amount.toFixed(2)} since ${s.first}.`, amount: s.amount, date: s.first });
+        if (s.period === 'yearly' || s.period === 'quarterly') {
+          const next = addDays(s.last, s.period === 'yearly' ? 365 : 91), t = today();
+          if (next >= t && diffDays(t, next) <= 30)
+            items.push({ id: `renew|${key}|${next}`, type: 'renewal', title: s.label, detail: `${s.period === 'yearly' ? 'Yearly' : 'Quarterly'} charge of about $${s.amount.toFixed(2)} due around ${next}.`, amount: s.amount, date: next });
+        }
+      }
+    }
+    const dismissed = new Set(state.watchDismissed || []);
+    const order = { duplicate: 0, new: 1, price: 2, renewal: 3, stopped: 4 };
+    const active = items.filter(i => !dismissed.has(i.id)).sort((a, b) => order[a.type] - order[b.type] || (a.date < b.date ? 1 : -1));
+    const subs = series.filter(s => !s.stopped).sort((a, b) => b.monthly - a.monthly);
+    return { items: active, dismissedCount: items.length - active.length, subs, subsMonthly: r2(subs.reduce((s, x) => s + x.monthly, 0)) };
   }
 
   // ---------- state ----------
@@ -528,7 +723,11 @@ const Core = (() => {
       oneTimes: [],
       skips: [],
       transactions: [],
-      imports: []
+      imports: [],
+      reimb: { enabled: false, allowance: 0, premiumMatch: '', expectDays: 3, claims: {} },
+      funds: [],
+      watchDismissed: [],
+      seenVersion: 2
     };
   }
   function defaultCategories() {
@@ -554,8 +753,21 @@ const Core = (() => {
   function migrate(s) {
     if (!s || typeof s !== 'object') return blankState();
     const b = blankState();
+    if (s.seenVersion === undefined) s.seenVersion = 1;
     for (const k of Object.keys(b)) if (s[k] === undefined) s[k] = b[k];
     s.settings = { ...b.settings, ...s.settings, ef: { ...b.settings.ef, ...(s.settings || {}).ef } };
+    s.reimb = { ...b.reimb, ...s.reimb, claims: { ...((s.reimb || {}).claims || {}) } };
+    if (!s.reimb.allowance && !s.reimb.dismissedSetup) {
+      // Upgrading from Phase 1: set up the tracker from past payouts if there are any.
+      const g = guessAllowance(s);
+      if (g) {
+        s.reimb.allowance = g; s.reimb.enabled = true; s.reimb.needsConfirm = true;
+        const prem = s.transactions.find(t => t.amount < 0 && /ANTHEM|PREMIUM|HEALTH INS/i.test(t.desc));
+        if (prem) s.reimb.premiumMatch = (prem.desc.match(/ANTHEM|PREMIUM|HEALTH INS/i) || [''])[0].toUpperCase();
+        // the tracker replaces hand-made "pending reimbursement" reminders
+        s.oneTimes = (s.oneTimes || []).filter(o => !(o.status === 'pending' && /reimburse/i.test(o.name)));
+      }
+    }
     s.schema = SCHEMA;
     return s;
   }
@@ -564,7 +776,8 @@ const Core = (() => {
     today, addDays, diffDays, monthOf, ymd, parseDate, num, r2, uid,
     parseCSV, parseFile, detectFormat, FORMATS, importRows, addManual, categorize, recategorizeAll, ruleMatches,
     occurrences, describeSched, cardCycleEstimate, cardPayments, cycleFor, lastTxnDate,
-    forecast, monthReview, paceNote, emergencyFund, blankState, defaultCategories, migrate
+    forecast, monthReview, paceNote, emergencyFund, blankState, defaultCategories, migrate,
+    reimbYear, reimbEvents, guessAllowance, fundStatus, fundsHeld, watchList, merchantKey, MONTH_NAMES, addMonths
   };
 })();
 if (typeof module !== 'undefined') module.exports = Core;
@@ -688,7 +901,7 @@ if (typeof module !== 'undefined') module.exports = Core;
 
     h += `<div class="grid3">
       <button class="stat" style="border:0;text-align:left" data-go="forecast"><div class="label">Low point</div><div class="val">${money0(fc.low)}</div><div class="when">${niceDow(fc.lowDate)}</div></button>
-      <div class="stat"><div class="label">Safe to spend</div><div class="val ${fc.safeToSpend > 0 ? 'pos' : ''}">${money0(fc.safeToSpend)}</div><div class="when">extra, beyond plan</div></div>
+      <div class="stat"><div class="label">Safe to spend</div><div class="val ${fc.safeToSpend > 0 ? 'pos' : ''}">${money0(fc.safeToSpend)}</div><div class="when">${fc.held ? "after set-asides" : "extra, beyond plan"}</div></div>
       <div class="stat"><div class="label">Next payday</div><div class="val">${fc.nextPay ? nice(fc.nextPay.date) : '—'}</div><div class="when">${fc.nextPay ? money0(fc.nextPay.amount) : 'none set'}</div></div>
     </div>
     <p class="sub small" style="margin:4px 4px 0">Low point and safe-to-spend look ${S.horizon} days ahead and keep ${money0(S.floor)} in checking.</p>`;
@@ -698,6 +911,11 @@ if (typeof module !== 'undefined') module.exports = Core;
     if (mr.review) notes.push(`<button class="link" data-act="show-review">${mr.review} transaction${mr.review > 1 ? 's' : ''} need a name →</button>`);
     const allReview = state.transactions.filter(t => t.review).length;
     if (allReview > mr.review) notes.push(`<button class="link" data-act="show-review">${allReview - mr.review} older transaction${allReview - mr.review > 1 ? 's' : ''} need a name →</button>`);
+    const ry = state.reimb && state.reimb.enabled ? Core.reimbYear(state, curYear()) : null;
+    if (state.reimb && state.reimb.needsConfirm) notes.push(`<button class="link" data-act="reimb">Health reimbursement tracker is set up at ${money(state.reimb.allowance)}/month. Check it →</button>`);
+    if (ry) for (const a of ry.alerts.slice(0, 3)) notes.push(`<button class="link" data-act="reimb" style="text-align:left;${a.level === 'warn' ? 'color:var(--red)' : ''}">${esc(a.text)} →</button>`);
+    const wl = Core.watchList(state);
+    if (wl.items.length) notes.push(`<button class="link" data-act="watch" style="text-align:left">${wl.items.length} thing${wl.items.length > 1 ? 's' : ''} on your watch list (${[...new Set(wl.items.map(i => WTYPE[i.type][0].toLowerCase()))].join(', ')}) →</button>`);
     for (const m of fc.threePay) notes.push(`<div>${monthName(m)} has <b>3 paychecks</b>. Decide where the extra one goes.</div>`);
     const zeroHits = mr.budgets.filter(b => b.cap === 0 && b.spent > 0);
     for (const b of zeroHits) notes.push(`<div><b>${esc(b.name)}</b> should be $0 this month — ${money(b.spent)} so far.</div>`);
@@ -710,6 +928,8 @@ if (typeof module !== 'undefined') module.exports = Core;
     // upcoming
     const up = fc.events.filter(e => e.counted).slice(0, 6);
     h += `<h2>Coming up</h2><div class="list">${up.length ? up.map(e => eventRow(e, fc)).join('') : `<div class="empty">Nothing scheduled. Add paychecks and bills in Settings.</div>`}</div>`;
+
+    h += reimbCard() + fundsCard();
 
     // this month
     h += `<h2>${monthName(ym)} vs. targets</h2><div class="card">${mr.budgets.length ? mr.budgets.map(b => budgetRow(b, ym)).join('') : '<div class="sub">No targets yet. Add them in Settings → Budget targets.</div>'}</div>`;
@@ -753,6 +973,8 @@ if (typeof module !== 'undefined') module.exports = Core;
       <div class="kv"><span>Start (${nice(S.balanceDate)})</span><b class="num">${money(S.balance)}</b></div>
       <div class="kv"><span>Lowest point</span><b class="num" style="color:${fc.status === 'green' ? 'var(--green)' : fc.status === 'yellow' ? 'var(--yellow)' : 'var(--red)'}">${money(fc.low)} · ${nice(fc.lowDate)}</b></div>
       <div class="kv"><span>Safety floor</span><span class="num">${money(S.floor)}</span></div>
+      ${fc.held ? `<div class="kv"><span>Held for set-asides</span><span class="num">${money(fc.held)}</span></div>` : ''}
+      <div class="kv"><span>Safe to spend</span><b class="num">${money(fc.safeToSpend)}</b></div>
       <div class="kv"><span>End (${nice(fc.to)})</span><span class="num">${money(fc.end)}</span></div>
     </div>`;
     h += `<p class="sub small" style="margin:0 4px 10px">Tap any line to skip it, change its amount, or enter a card's real statement balance. Card payments are estimated from the charges you've imported plus bills set to that card.</p>`;
@@ -797,6 +1019,9 @@ if (typeof module !== 'undefined') module.exports = Core;
         ${c.closed ? '' : `<p class="hint">This statement hasn't closed yet, so more charges will be added. The planned-spending line in the forecast covers that.</p>`}
         ${field('Real statement balance (from your card app)', 'ov', e.entered ? e.amount : '', 'money', 'placeholder="Leave blank to estimate"')}
         <div class="btnrow"><button class="btn" data-sheet="save-card">Save</button><button class="btn secondary" data-sheet="skip">${skipped ? 'Count it again' : 'Already paid – skip'}</button></div>`;
+    } else if (e.kind === 'reimb') {
+      body += `<p>${e.pending ? 'This claim is submitted but not approved yet, so it isn\'t counted.' : 'This claim is approved. It counts in the forecast until the payout shows up in an import.'}</p>
+        <div class="btnrow"><button class="btn" data-sheet="open-reimb">Open tracker</button><button class="btn secondary" data-sheet="skip">${skipped ? 'Count it again' : 'Leave it out'}</button></div>`;
     } else if (e.kind === 'one') {
       const o = state.oneTimes.find(x => x.id === e.oneId);
       body += oneTimeForm(o) + `<div class="btnrow"><button class="btn" data-sheet="save-one">Save</button><button class="btn danger" data-sheet="del-one">Delete</button></div>`;
@@ -814,6 +1039,7 @@ if (typeof module !== 'undefined') module.exports = Core;
       'skip': () => { const s = new Set(state.skips || []); skipped ? s.delete(key) : s.add(key); state.skips = [...s]; done(); },
       'save-amt': () => { const item = state.recurring.find(i => i.id === e.itemId); item.amountOverrides = item.amountOverrides || {}; item.amountOverrides[e.date] = Core.r2(Core.num(val('amt'))); done(); },
       'edit-item': () => recurringSheet(e.itemId),
+      'open-reimb': () => reimbSheet(+e.ym.slice(0, 4)),
       'save-one': () => { readOneTime(state.oneTimes.find(x => x.id === e.oneId)); done(); },
       'del-one': () => { state.oneTimes = state.oneTimes.filter(x => x.id !== e.oneId); done(); }
     });
@@ -885,6 +1111,7 @@ if (typeof module !== 'undefined') module.exports = Core;
       <p class="sub" style="margin-top:-8px">${niceDow(t.date)} · ${esc(acct(t.account).name)} · <b class="num">${t.amount > 0 ? '+' : '−'}${money(Math.abs(t.amount))}</b>${t.bankCat ? ` · bank says "${esc(t.bankCat)}"` : ''}</p>
       ${select('Category', 'cat', t.cat, catOptions())}
       ${field('Note (what was it?)', 'note', t.note || '', 'text', 'placeholder="e.g. Church, gift for Mom"')}
+      ${(state.funds || []).length && t.amount < 0 ? select('Paid from set-aside', 'fund', t.fund || '', [['', 'Automatic (by the set-aside\'s rules)'], ...state.funds.map(f => [f.id, f.name])]) : ''}
       ${check('Always use this category for merchants containing:', 'always', false)}
       ${field('', 'pattern', guessPattern(t.desc))}
       <p class="hint">Applies to past and future transactions (but not ones you've set by hand).</p>
@@ -892,6 +1119,7 @@ if (typeof module !== 'undefined') module.exports = Core;
     openSheet(body, {
       save: () => {
         t.cat = val('cat'); t.note = val('note').trim(); t.review = false; t.locked = true;
+        if (val('fund') !== undefined) { if (val('fund')) t.fund = val('fund'); else delete t.fund; }
         if (val('always') && val('pattern').trim()) {
           state.rules.unshift({ id: Core.uid(), pattern: val('pattern').trim(), cat: t.cat });
           Core.recategorizeAll(state);
@@ -1034,6 +1262,9 @@ if (typeof module !== 'undefined') module.exports = Core;
         ${sec('edit-balance', 'Balance & safety floor', `${money(S.balance)} on ${nice(S.balanceDate)} · floor ${money0(S.floor)}`)}
         ${sec('list-recurring', 'Paychecks & bills', `${state.recurring.length} items`)}
         ${sec('list-budgets', 'Budget targets', `${state.budgets.length} targets`)}
+        ${sec('reimb', 'Health reimbursement', state.reimb && state.reimb.enabled ? `${money(state.reimb.allowance)}/month` : 'Off')}
+        ${sec('funds', 'Set-asides', (state.funds || []).length ? state.funds.map(f => f.name).join(', ') : 'None yet')}
+        ${sec('watch', 'Watch list', 'Subscriptions, price changes, double charges')}
         ${sec('edit-ef', 'Emergency fund', `${S.ef.steps.map(s => money0(s.amount)).join(' → ')}${S.ef.goal ? ' · goal ' + money0(S.ef.goal) : ''}`)}
       </div>
       <h2>Accounts & sorting</h2><div class="list">
@@ -1277,6 +1508,7 @@ if (typeof module !== 'undefined') module.exports = Core;
       if (!data || !data.settings || !Array.isArray(data.transactions)) throw new Error('bad');
       if (state && !confirm('Replace everything on this phone with this file?')) return;
       state = Core.migrate(data); save(); ui.tab = 'home'; saveTab(); render(); toast('Loaded.');
+      if ((state.seenVersion || 1) < 2) setTimeout(whatsNewSheet, 300);
     } catch (e) { toast("That file isn't a Pocket Budget backup or setup file."); }
   }
   function summaryText() {
@@ -1293,6 +1525,13 @@ if (typeof module !== 'undefined') module.exports = Core;
       m.budgets.forEach(b => lines.push(`${b.name}: ${b.spent.toFixed(2)} / ${b.cap}`));
       lines.push(`Total spent ${m.spending.toFixed(2)}, money in ${m.income.toFixed(2)}`);
     }
+    if (state.reimb && state.reimb.enabled) {
+      const ry = Core.reimbYear(state, curYear());
+      lines.push('', `Health reimbursement ${ry.year}: ${ry.months.map(o => o.short + ' ' + RSTAT[o.status][0].toLowerCase()).join(', ')}. Paid ${ry.paidTotal.toFixed(2)} of ${ry.earned.toFixed(2)} earned.`);
+    }
+    if ((state.funds || []).length) { lines.push('', `Set-asides (held ${fc.held.toFixed(2)}):`); state.funds.forEach(f => { const x = Core.fundStatus(state, f); lines.push(`${f.name}: ${x.balance.toFixed(2)} (${f.monthly}/mo)`); }); }
+    const wl = Core.watchList(state);
+    if (wl.items.length) { lines.push('', 'Watch list:'); wl.items.forEach(i => lines.push(`${WTYPE[i.type][0]}: ${i.title} — ${i.detail}`)); }
     const rv = state.transactions.filter(t => t.review).slice(0, 15);
     if (rv.length) { lines.push('', 'Unnamed transactions:'); rv.forEach(t => lines.push(`${t.date} ${t.amount.toFixed(2)} ${t.desc}`)); }
     return lines.join('\n');
@@ -1307,6 +1546,208 @@ if (typeof module !== 'undefined') module.exports = Core;
   }
 
   function done(msg) { save(); closeSheet(); render(); if (msg) toast(msg); }
+
+  // ---------- PHASE 2: health reimbursement ----------
+  const RSTAT = {
+    paid: ['Paid', 'green'], approved: ['Approved', 'green'], submitted: ['Submitted', 'yellow'],
+    todo: ['Submit claim', 'red'], waiting: ['Waiting on premium', ''], future: ['Upcoming', ''], skip: ['No claim', '']
+  };
+  const curYear = () => +Core.today().slice(0, 4);
+
+  function reimbCard() {
+    const R = state.reimb;
+    if (!R || !R.enabled) return '';
+    const ry = Core.reimbYear(state, curYear()); if (!ry) return '';
+    const strip = ry.months.map(o => `<span title="${o.name}: ${RSTAT[o.status][0]}" style="flex:1;text-align:center;font-size:11px">
+        <span style="display:block;height:8px;border-radius:4px;margin-bottom:3px;background:${o.status === 'paid' || o.status === 'approved' ? 'var(--green)' : o.status === 'submitted' ? 'var(--yellow)' : o.status === 'todo' ? 'var(--red)' : 'var(--bar)'}"></span>${o.short[0]}</span>`).join('');
+    const n = ry.next;
+    return `<h2>Health reimbursement ${ry.year}</h2><button class="card" style="width:100%;text-align:left;border:0" data-act="reimb">
+      <div class="row" style="gap:3px">${strip}</div>
+      <div class="row between" style="margin-top:10px"><span>${n ? `${esc(n.name)}: <b>${RSTAT[n.status][0]}</b>` : 'All months handled'}</span><span class="num sub small">${money0(ry.paidTotal)} of ${money0(ry.earned)} paid</span></div>
+      ${ry.unclaimed > 0.5 ? `<div class="small" style="color:var(--red);margin-top:4px">${money(ry.unclaimed)} not paid yet this year</div>` : ''}
+    </button>`;
+  }
+
+  function reimbSheet(year) {
+    year = year || curYear();
+    const R = state.reimb;
+    if (!R.enabled || !R.allowance) return reimbSettings();
+    const ry = Core.reimbYear(state, year);
+    const body = `<h3>Health reimbursement</h3>
+      <div class="monthnav"><button data-sheet="yr" data-y="${year - 1}" aria-label="Previous year">‹</button><span class="m">${year} plan year</span><button data-sheet="yr" data-y="${year + 1}" aria-label="Next year">›</button></div>
+      ${R.needsConfirm ? `<div class="banner info"><b>Check these settings</b>I found your past payouts and set the allowance to ${money(R.allowance)} a month, matched to "${esc(R.premiumMatch || 'premium')}" charges.<div class="btnrow"><button class="btn sm" data-sheet="confirm">Looks right</button><button class="btn secondary sm" data-sheet="settings">Change</button></div></div>` : ''}
+      ${ry.alerts.map(a => `<div class="banner ${a.level === 'warn' ? 'yellow' : 'info'}">${esc(a.text)}</div>`).join('')}
+      <div class="card"><div class="kv"><span>Allowance</span><span class="num">${money(R.allowance)}/month</span></div>
+        <div class="kv"><span>Earned so far</span><span class="num">${money(ry.earned)}</span></div>
+        <div class="kv"><span>Paid to you</span><span class="num">${money(ry.paidTotal)}</span></div>
+        <div class="kv"><span>Not paid yet</span><b class="num">${money(ry.unclaimed)}</b></div></div>
+      <div class="list">${ry.months.map(o => `<button class="item" data-sheet="month" data-ym="${o.ym}"><div class="main"><div class="title">${o.name}</div>
+        <div class="meta">${o.premium ? `Premium ${money(o.premium.amount)} on ${nice(o.premium.date)}` : 'No premium found yet'}${o.auto ? ' · matched to payouts' : ''}${o.claim.submitted && o.status === 'submitted' ? ` · sent ${nice(o.claim.submitted)}` : ''}${o.claim.approved && o.status === 'approved' ? ` · approved ${nice(o.claim.approved)}` : ''}</div></div>
+        <div class="right"><span class="pill ${RSTAT[o.status][1]}">${RSTAT[o.status][0]}</span></div></button>`).join('')}</div>
+      <p class="hint">Payouts are matched to the oldest months first, so a lump payment covers several months. Only approved claims count in your forecast.</p>
+      <button class="btn secondary block" data-sheet="settings">Reimbursement settings</button>`;
+    openSheet(body, {
+      yr: el => reimbSheet(+el.dataset.y),
+      month: el => reimbMonthSheet(el.dataset.ym),
+      settings: reimbSettings,
+      confirm: () => { delete R.needsConfirm; save(); reimbSheet(year); render(); }
+    });
+  }
+
+  function reimbMonthSheet(ym) {
+    const R = state.reimb, year = +ym.slice(0, 4);
+    const o = Core.reimbYear(state, year).months.find(m => m.ym === ym);
+    const c = R.claims[ym] || {};
+    let st = c.status || 'none';
+    const body = `<h3>${o.name} ${year}</h3>
+      ${o.auto ? `<div class="banner green">Paid. This month is covered by the payouts you've imported.</div>` : ''}
+      <div class="seg" id="rseg">${[['none', 'Not sent'], ['submitted', 'Submitted'], ['approved', 'Approved'], ['paid', 'Paid']].map(([v, l]) => `<button data-v="${v}" class="${st === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+      <div data-for="submitted approved paid">${field('Date submitted', 'sub', c.submitted || Core.today(), 'date')}</div>
+      <div data-for="approved paid">${field('Date approved', 'app', c.approved || Core.today(), 'date')}
+        ${field('Expected payment date (optional)', 'exp', c.expected || '', 'date')}</div>
+      <div data-for="submitted approved">${field('Amount', 'amt', c.amount || R.allowance, 'money')}</div>
+      ${check('No claim this month (skip it)', 'skip', c.status === 'skip')}
+      <p class="hint">"Paid" is filled in automatically when the payout shows up in an import. Mark it by hand if you haven't imported yet.</p>
+      <div class="btnrow"><button class="btn" data-sheet="save">Save</button></div>`;
+    const sync = ov => ov.querySelectorAll('[data-for]').forEach(d => d.style.display = d.dataset.for.split(' ').includes(st) ? '' : 'none');
+    openSheet(body, {
+      mounted: ov => { sync(ov); ov.querySelectorAll('#rseg button').forEach(b => b.onclick = () => { st = b.dataset.v; ov.querySelectorAll('#rseg button').forEach(x => x.classList.toggle('on', x === b)); sync(ov); }); },
+      save: () => {
+        if (val('skip')) R.claims[ym] = { status: 'skip' };
+        else if (st === 'none') delete R.claims[ym];
+        else R.claims[ym] = { status: st, submitted: val('sub') || undefined, approved: st !== 'submitted' ? (val('app') || undefined) : undefined, expected: st === 'approved' ? (val('exp') || undefined) : undefined, amount: Core.r2(Core.num(val('amt'))) || R.allowance };
+        save(); render(); reimbSheet(year);
+      }
+    });
+  }
+
+  function reimbSettings() {
+    const R = state.reimb;
+    const body = `<h3>Reimbursement settings</h3>
+      ${check('Track a health reimbursement', 'en', R.enabled)}
+      ${field('Monthly allowance', 'allow', R.allowance || '', 'money')}
+      ${field('Premium charge contains (comma-separated)', 'pm', R.premiumMatch || '', 'text', 'placeholder="e.g. ANTHEM"')}
+      <p class="hint">Payouts are the transactions in the "Health reimbursement" category. Use an auto-sort rule to put your payout there.</p>
+      ${field('Days from approval to payment', 'days', R.expectDays || 3, 'number', 'inputmode="numeric"')}
+      <div class="btnrow"><button class="btn" data-sheet="save">Save</button></div>`;
+    openSheet(body, {
+      save: () => {
+        R.enabled = val('en'); R.allowance = Core.r2(Core.num(val('allow'))); R.premiumMatch = val('pm').trim(); R.expectDays = +val('days') || 3;
+        delete R.needsConfirm; if (!R.enabled) R.dismissedSetup = true;
+        save(); render(); if (R.enabled && R.allowance) reimbSheet(); else closeSheet();
+      }
+    });
+  }
+
+  // ---------- PHASE 2: set-asides ----------
+  function fundsCard() {
+    const funds = state.funds || [];
+    if (!funds.length) return `<h2>Set-asides</h2><button class="card" style="width:100%;text-align:left;border:0" data-act="funds"><b>Save ahead for lumpy bills</b><div class="sub small">Propane, septic, truck repairs: put a little aside each month so they aren't a surprise. Tap to set up.</div></button>`;
+    const st = funds.map(f => Core.fundStatus(state, f));
+    const held = st.reduce((s, x) => s + Math.max(0, x.balance), 0);
+    return `<h2>Set-asides</h2><button class="card" style="width:100%;text-align:left;border:0" data-act="funds">
+      ${st.map(x => `<div class="kv"><span>${esc(x.name)}</span><span class="num ${x.balance < 0 ? '' : ''}" style="${x.balance < 0 ? 'color:var(--red)' : ''}">${x.balance < 0 ? 'short ' + money(-x.balance) : money(x.balance)}</span></div>`).join('')}
+      <div class="sub small" style="margin-top:6px">${money(held)} held back in checking. It's left out of Safe to spend and your emergency fund.</div></button>`;
+  }
+
+  function fundsSheet() {
+    const funds = state.funds || [];
+    const st = funds.map(f => Core.fundStatus(state, f));
+    const missing = suggestedFunds().filter(s => !funds.some(f => f.name.toLowerCase() === s.name.toLowerCase()));
+    const body = `<h3>Set-asides</h3><p class="sub" style="margin-top:-8px">Money held in checking for bills that don't come every month. Each month adds its amount; matching bills come out of it.</p>
+      <div class="list">${st.map(x => `<button class="item" data-sheet="edit" data-id="${x.id}"><div class="main"><div class="title">${esc(x.name)}</div><div class="meta">${money(x.monthly)}/month since ${nice(x.start)} ${x.start.slice(0, 4)} · ${x.payments.length} payment${x.payments.length === 1 ? '' : 's'}</div></div>
+        <div class="right num" style="${x.balance < 0 ? 'color:var(--red)' : ''}">${x.balance < 0 ? 'short ' + money(-x.balance) : money(x.balance)}</div></button>`).join('') || '<div class="empty">No set-asides yet.</div>'}</div>
+      ${missing.length ? `<button class="btn block" data-sheet="suggest">Add ${missing.map(m => m.name.toLowerCase()).join(', ')}</button>` : ''}
+      <button class="btn secondary block" style="margin-top:8px" data-sheet="add">+ Add a set-aside</button>
+      <p class="hint" style="margin-top:12px">Total held: ${money(st.reduce((s, x) => s + Math.max(0, x.balance), 0))}. A set-aside that's "short" means a bill cost more than had built up.</p>`;
+    openSheet(body, { edit: el => fundSheet(el.dataset.id), add: () => fundSheet(null), suggest: () => addSuggestedFunds(missing) });
+  }
+
+  function suggestedFunds() {
+    return [
+      { name: 'Propane', monthly: 120, match: 'propane, SHELBY COUNTY CO', cats: [] },
+      { name: 'Septic', monthly: 6.67, match: 'septic', cats: [] },
+      { name: 'Truck repairs', monthly: 100, match: '', cats: ['truck'] }
+    ];
+  }
+  function addSuggestedFunds(list) {
+    const start = Core.monthOf(Core.today()) + '-01';
+    for (const s of list) state.funds.push({ id: Core.uid(), start, startBalance: 0, cap: 0, ...s });
+    const reserve = state.recurring.find(i => i.reserve && i.sched && i.sched.kind === 'weekly');
+    let msg = 'Set-asides added.';
+    if (list.some(s => s.cats.includes('truck')) && reserve && reserve.amount >= 100) {
+      const cut = Core.r2(100 * 12 / 52);
+      if (confirm(`Truck repairs now have their own set-aside ($100/month).\n\nLower "${reserve.name}" from ${money(reserve.amount)} to ${money(reserve.amount - cut)} a week so the $100 isn't counted twice?`)) {
+        reserve.amount = Math.round(reserve.amount - cut); msg = `Set-asides added. Planned spending is now ${money(reserve.amount)} a week.`;
+      }
+    }
+    save(); render(); fundsSheet(); toast(msg);
+  }
+
+  function fundSheet(id) {
+    const isNew = !id;
+    const f = isNew ? { id: Core.uid(), name: '', monthly: '', match: '', cats: [], start: Core.monthOf(Core.today()) + '-01', startBalance: 0, cap: 0 } : state.funds.find(x => x.id === id);
+    const stt = isNew ? null : Core.fundStatus(state, f);
+    const body = `<h3>${isNew ? 'Add a set-aside' : esc(f.name)}</h3>
+      ${stt ? `<div class="card"><div class="kv"><span>Built up</span><span class="num">${money(stt.accrued)}</span></div><div class="kv"><span>Paid out</span><span class="num">−${money(stt.spent)}</span></div><div class="kv"><span>Balance</span><b class="num">${money(stt.balance)}</b></div></div>
+        ${stt.payments.length ? `<div class="list">${stt.payments.slice(0, 8).map(t => `<div class="item"><div class="main"><div class="title">${esc(t.note || t.desc)}</div><div class="meta">${nice(t.date)}</div></div><div class="right num">${money(-t.amount)}</div></div>`).join('')}</div>` : ''}` : ''}
+      ${field('Name', 'name', f.name)}${field('Put aside each month', 'monthly', f.monthly, 'money')}
+      <p class="hint">Tip: for a bill every few years, divide the cost by the months between bills. Septic every 5 years at $400 is about $6.67 a month.</p>
+      ${field('Bills that come out of it: description or note contains (comma-separated)', 'match', f.match)}
+      <span class="sub small" style="margin:0 4px">…or any charge in these categories:</span>
+      <div class="card" style="margin-top:6px">${catOptions(['spend']).map(([v, l]) => check(esc(l), 'fc_' + v, (f.cats || []).includes(v))).join('')}</div>
+      ${field('Start counting from', 'start', f.start, 'date')}
+      ${field('Starting balance (money already set aside)', 'sb', f.startBalance || 0, 'money')}
+      ${field('Stop adding once it reaches (optional)', 'cap', f.cap || '', 'money')}
+      <p class="hint">You can also tap any transaction and choose "Paid from set-aside".</p>
+      <div class="btnrow"><button class="btn" data-sheet="save">Save</button>${isNew ? '' : '<button class="btn danger" data-sheet="del">Delete</button>'}</div>`;
+    openSheet(body, {
+      save: () => {
+        f.name = val('name').trim() || 'Set-aside'; f.monthly = Core.r2(Math.abs(Core.num(val('monthly')))); f.match = val('match').trim();
+        f.cats = catOptions(['spend']).map(([v]) => v).filter(v => val('fc_' + v));
+        f.start = val('start') || f.start; f.startBalance = Core.r2(Core.num(val('sb'))); f.cap = Core.r2(Core.num(val('cap')));
+        if (isNew) state.funds.push(f); save(); render(); fundsSheet();
+      },
+      del: () => { if (confirm(`Delete the "${f.name}" set-aside? The money stays in checking.`)) { state.funds = state.funds.filter(x => x !== f); state.transactions.forEach(t => { if (t.fund === f.id) delete t.fund; }); save(); render(); fundsSheet(); } }
+    });
+  }
+
+  // ---------- PHASE 2: watch list ----------
+  const WTYPE = { duplicate: ['Possible double charge', 'red'], new: ['New', 'yellow'], price: ['Price change', 'yellow'], renewal: ['Coming up', ''], stopped: ['Stopped', ''] };
+  function watchSheet(showSubs) {
+    const w = Core.watchList(state);
+    const body = `<h3>Watch list</h3>
+      <div class="seg"><button class="${showSubs ? '' : 'on'}" data-sheet="tab" data-s="0">To look at (${w.items.length})</button><button class="${showSubs ? 'on' : ''}" data-sheet="tab" data-s="1">Regular charges</button></div>
+      ${showSubs ? `<p class="sub" style="margin-top:0">Charges that repeat on a schedule: about <b>${money(w.subsMonthly)}</b> a month in total.</p>
+        <div class="list">${w.subs.map(s => `<div class="item"><div class="main"><div class="title">${esc(s.label)}</div><div class="meta">${s.period} · last ${nice(s.last)} ${s.last.slice(0, 4)} · ${s.n} charges</div></div><div class="right"><div class="num">${money(s.amount)}</div><div class="meta num">${money(s.monthly)}/mo</div></div></div>`).join('') || '<div class="empty">None found yet. Import a few months of history.</div>'}</div>`
+      : `<div class="list">${w.items.map(i => `<div class="item"><div class="main"><div class="title"><span class="pill ${WTYPE[i.type][1]}">${WTYPE[i.type][0]}</span> ${esc(i.title)}</div><div class="meta" style="white-space:normal">${esc(i.detail)}</div></div>
+          <div class="right"><button class="btn secondary sm" data-sheet="dismiss" data-id="${esc(i.id)}">OK</button></div></div>`).join('') || '<div class="empty">Nothing new to look at.</div>'}</div>
+        ${w.dismissedCount ? `<button class="link" data-sheet="restore">Show ${w.dismissedCount} I've already looked at</button>` : ''}
+        <p class="hint">Tap OK once you've checked something and it won't come back.</p>`}`;
+    openSheet(body, {
+      tab: el => watchSheet(el.dataset.s === '1'),
+      dismiss: el => { state.watchDismissed = [...new Set([...(state.watchDismissed || []), el.dataset.id])]; save(); render(); watchSheet(false); },
+      restore: () => { state.watchDismissed = []; save(); render(); watchSheet(false); }
+    });
+  }
+
+  // ---------- PHASE 2: what's new ----------
+  function whatsNewSheet() {
+    const funds = state.funds || [];
+    const missing = suggestedFunds().filter(s => !funds.some(f => f.name.toLowerCase() === s.name.toLowerCase()));
+    const body = `<h3>New in Pocket Budget</h3>
+      <div class="card stack">
+        <div><b>Health reimbursement tracker</b><div class="sub small">Shows each month's claim (submitted, approved, paid), reminds you after the premium posts, and warns before Dec 31. Approved claims count in the forecast.</div></div>
+        <div><b>Set-asides</b><div class="sub small">Put a little aside each month for propane, septic and truck repairs. That money is held back from Safe to spend.</div></div>
+        <div><b>Watch list</b><div class="sub small">Flags new subscriptions, price changes, double charges, and charges that stopped.</div></div>
+      </div>
+      ${missing.length ? `<button class="btn block" data-sheet="suggest">Add set-asides: ${missing.map(m => `${m.name} ${money0(m.monthly)}`).join(', ')}</button>` : ''}
+      <button class="btn secondary block" style="margin-top:8px" data-sheet="ok">Got it</button>`;
+    openSheet(body, {
+      suggest: () => { state.seenVersion = 2; addSuggestedFunds(missing); },
+      ok: () => { state.seenVersion = 2; done(); }
+    });
+  }
 
   // ---------- events ----------
   const pick = (id) => { const i = $(id); i.value = ''; i.click(); };
@@ -1339,6 +1780,7 @@ if (typeof module !== 'undefined') module.exports = Core;
       'list-recurring': listRecurring, 'list-budgets': listBudgets, 'edit-ef': efSheet,
       'list-accounts': listAccounts, 'edit-account': () => accountSheet(a.dataset.id), 'list-categories': listCategories, 'list-rules': listRules,
       'backup': backup, 'summary': summarySheet,
+      'reimb': () => reimbSheet(), 'funds': fundsSheet, 'watch': () => watchSheet(false),
       'reset': () => { if (confirm('Erase all data on this phone? Make a backup first if you might want it back.') && confirm('Are you sure? This cannot be undone.')) { state = null; try { localStorage.removeItem(KEY); } catch (e) {} render(); } }
     };
     if (actions[act]) actions[act]();
@@ -1364,6 +1806,7 @@ if (typeof module !== 'undefined') module.exports = Core;
 
   // ---------- start ----------
   load(); render();
+  if (state && (state.seenVersion || 1) < 2) setTimeout(whatsNewSheet, 300);
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => {});
   window.PocketBudget = { get state() { return state; }, render };
 })();
